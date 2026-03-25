@@ -1,0 +1,132 @@
+name: 수집 상태 점검
+
+on:
+  schedule:
+    # 매일 오전 9시 KST (= UTC 0시) 실행
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 수집 상태 점검
+        id: check
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import csv
+          import os
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+
+          KST = timezone(timedelta(hours=9))
+          now = datetime.now(KST)
+          log_path = Path("logs/collection_log.csv")
+
+          if not log_path.exists():
+              print("::set-output name=status::FAIL")
+              print("::set-output name=message::수집 로그 파일이 존재하지 않습니다.")
+              exit(0)
+
+          # 최근 24시간 수집 기록 분석
+          recent_collections = []
+          with open(log_path, "r", encoding="utf-8") as f:
+              reader = csv.DictReader(f)
+              for row in reader:
+                  try:
+                      ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+                      ts = ts.replace(tzinfo=KST)
+                      if (now - ts).total_seconds() < 86400:  # 24시간
+                          recent_collections.append(row)
+                  except (ValueError, KeyError):
+                      continue
+
+          # data_go_kr 수집만 분석 (주 데이터 소스)
+          data_go_kr_collections = [r for r in recent_collections if r.get("source") == "data_go_kr"]
+          
+          expected_min = 40  # 24시간 × 2회/시 = 48회, 80% 이상이면 OK
+          actual = len(data_go_kr_collections)
+          
+          # 최근 수집 시각
+          if data_go_kr_collections:
+              last_ts = max(r["timestamp"] for r in data_go_kr_collections)
+              last_dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+              gap_hours = (now - last_dt).total_seconds() / 3600
+          else:
+              gap_hours = 999
+
+          # 수집 실패 건수
+          fail_count = sum(1 for r in data_go_kr_collections if int(r.get("hospitals_collected", 0)) == 0)
+
+          # 판정
+          issues = []
+          if actual < expected_min:
+              issues.append(f"24시간 수집 횟수 부족: {actual}회 (기대: 48회 이상)")
+          if gap_hours > 3:
+              issues.append(f"최근 수집 공백: {gap_hours:.1f}시간 전")
+          if fail_count > 5:
+              issues.append(f"수집 실패 {fail_count}건 (24시간 내)")
+
+          if issues:
+              status = "WARN"
+              message = " / ".join(issues)
+          else:
+              status = "OK"
+              message = f"정상 운영 중 (24시간 내 {actual}회 수집, 최근 {gap_hours:.1f}시간 전)"
+
+          print(f"상태: {status}")
+          print(f"내용: {message}")
+
+          # GitHub Actions output
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"status={status}\n")
+              f.write(f"message={message}\n")
+              f.write(f"actual_count={actual}\n")
+              f.write(f"gap_hours={gap_hours:.1f}\n")
+          PYTHON_SCRIPT
+
+      - name: 문제 발견 시 Issue 생성
+        if: steps.check.outputs.status == 'WARN' || steps.check.outputs.status == 'FAIL'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.check.outputs.status }}';
+            const message = '${{ steps.check.outputs.message }}';
+            const today = new Date().toISOString().split('T')[0];
+            
+            // 같은 날짜의 이슈가 이미 있으면 건너뜀
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'healthcheck',
+              per_page: 5
+            });
+            
+            const alreadyReported = existingIssues.data.some(
+              issue => issue.title.includes(today)
+            );
+            
+            if (!alreadyReported) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `⚠️ 수집 상태 이상 감지 (${today})`,
+                body: `## 수집 상태 점검 결과\n\n- **상태**: ${status}\n- **내용**: ${message}\n- **점검 시각**: ${new Date().toISOString()}\n\n자동 생성된 이슈입니다. 확인 후 닫아주세요.`,
+                labels: ['healthcheck']
+              });
+            }

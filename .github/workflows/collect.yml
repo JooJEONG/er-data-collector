@@ -1,0 +1,52 @@
+name: 응급실 데이터 수집
+
+on:
+  schedule:
+    # 매 30분마다 실행 (UTC 기준, KST = UTC+9)
+    - cron: '0,30 * * * *'
+  workflow_dispatch:  # 수동 실행도 가능
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 데이터 수집 실행
+        env:
+          DATA_GO_KR_API_KEY: ${{ secrets.DATA_GO_KR_API_KEY }}
+          MEDIBOARD_ENABLED: 'true'
+        run: python scripts/er_data_collector.py
+
+      - name: 수집 결과 커밋 & 푸시
+        run: |
+          git config user.name "ER Data Bot"
+          git config user.email "er-data-bot@github.actions"
+          
+          # 변경사항이 있을 때만 커밋
+          git add data/ logs/
+          if git diff --staged --quiet; then
+            echo "변경사항 없음 - 커밋 건너뜀"
+          else
+            TIMESTAMP=$(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M KST')
+            HOSPITAL_COUNT=$(find data/data_go_kr -name "*.csv" -newer .git/index 2>/dev/null | head -1 | xargs -I{} wc -l {} 2>/dev/null | awk '{print $1}' || echo "?")
+            git commit -m "📊 데이터 수집: ${TIMESTAMP}"
+            
+            # 푸시 실패 시 재시도 (동시 실행 대비)
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push origin main && break
+              echo "푸시 재시도 $i/3..."
+              sleep 5
+            done
+          fi

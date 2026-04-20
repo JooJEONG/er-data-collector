@@ -1,0 +1,166 @@
+name: 월별 데이터 Google Drive 아카이브
+
+on:
+  schedule:
+    # 매월 2일 새벽 3시 KST (= 매월 1일 18:00 UTC)
+    - cron: '0 18 1 * *'
+  workflow_dispatch:  # 수동 실행 가능
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 아카이브 대상 폴더 확인
+        id: check
+        run: |
+          # 현재 날짜 기준 2개월 이전 폴더를 아카이브 대상으로 선정
+          # 예: 현재 2026-06이면 2026-04 이전 폴더가 대상
+          CUTOFF=$(date -d "2 months ago" '+%Y-%m')
+          echo "cutoff=$CUTOFF" >> "$GITHUB_OUTPUT"
+
+          TARGETS=""
+          for dir in data/data_go_kr/*/; do
+            [ -d "$dir" ] || continue
+            FOLDER_NAME=$(basename "$dir")
+            if [[ "$FOLDER_NAME" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+              if [[ "$FOLDER_NAME" < "$CUTOFF" ]]; then
+                TARGETS="$TARGETS $FOLDER_NAME"
+              fi
+            fi
+          done
+
+          TARGETS=$(echo "$TARGETS" | xargs)
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$TARGETS" ]; then
+            echo "아카이브 대상 폴더 없음 (기준: $CUTOFF 이전)"
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "아카이브 대상: $TARGETS (기준: $CUTOFF 이전)"
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: ZIP 압축
+        if: steps.check.outputs.has_targets == 'true'
+        run: |
+          mkdir -p archive_tmp
+          for FOLDER in ${{ steps.check.outputs.targets }}; do
+            SRC="data/data_go_kr/$FOLDER"
+            if [ -d "$SRC" ]; then
+              ZIP_NAME="er_data_${FOLDER}.zip"
+              echo "압축 중: $SRC → archive_tmp/$ZIP_NAME"
+              (cd "$SRC" && zip -r "../../archive_tmp/$ZIP_NAME" .)
+              echo "  → $(du -h archive_tmp/$ZIP_NAME | cut -f1)"
+            fi
+          done
+          echo "=== 압축 완료 ==="
+          ls -lh archive_tmp/
+
+      - name: Google Drive 업로드
+        if: steps.check.outputs.has_targets == 'true'
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          pip install google-api-python-client google-auth
+          python3 << 'PYEOF'
+          import os, json, base64, glob, sys
+
+          sa_key_b64 = os.environ.get("GDRIVE_SA_KEY", "")
+          folder_id = os.environ.get("GDRIVE_FOLDER_ID", "")
+
+          if not sa_key_b64 or not folder_id:
+              print("❌ GDRIVE_SA_KEY 또는 GDRIVE_FOLDER_ID 시크릿이 설정되지 않았습니다.")
+              sys.exit(1)
+
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          sa_info = json.loads(base64.b64decode(sa_key_b64))
+          creds = service_account.Credentials.from_service_account_info(
+              sa_info, scopes=["https://www.googleapis.com/auth/drive.file"]
+          )
+          service = build("drive", "v3", credentials=creds)
+
+          zip_files = sorted(glob.glob("archive_tmp/er_data_*.zip"))
+          if not zip_files:
+              print("업로드할 zip 파일 없음")
+              sys.exit(0)
+
+          for zip_path in zip_files:
+              filename = os.path.basename(zip_path)
+              size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+              print(f"업로드 중: {filename} ({size_mb:.1f} MB)")
+
+              # 동일 이름 파일이 이미 있으면 업데이트
+              results = service.files().list(
+                  q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
+                  fields="files(id, name)"
+              ).execute()
+
+              media = MediaFileUpload(zip_path, mimetype="application/zip", resumable=True)
+
+              if results.get("files"):
+                  file_id = results["files"][0]["id"]
+                  service.files().update(fileId=file_id, media_body=media).execute()
+                  print(f"  ✅ 기존 파일 업데이트 완료 (ID: {file_id})")
+              else:
+                  file_metadata = {"name": filename, "parents": [folder_id]}
+                  uploaded = service.files().create(
+                      body=file_metadata, media_body=media, fields="id"
+                  ).execute()
+                  print(f"  ✅ 새 파일 업로드 완료 (ID: {uploaded['id']})")
+
+          print(f"\n=== {len(zip_files)}개 파일 Google Drive 업로드 완료 ===")
+          PYEOF
+
+      - name: 아카이브된 폴더 삭제 및 커밋
+        if: steps.check.outputs.has_targets == 'true'
+        run: |
+          for FOLDER in ${{ steps.check.outputs.targets }}; do
+            SRC="data/data_go_kr/$FOLDER"
+            if [ -d "$SRC" ]; then
+              echo "삭제: $SRC"
+              git rm -r "$SRC"
+            fi
+          done
+
+          git config user.name "ER Data Bot"
+          git config user.email "er-data-bot@github.actions"
+
+          ARCHIVED="${{ steps.check.outputs.targets }}"
+          git commit -m "🗄️ 아카이브: ${ARCHIVED} → Google Drive 이동 완료"
+
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            echo "푸시 재시도 $i/3..."
+            sleep 5
+          done
+
+      - name: 결과 요약
+        if: always()
+        run: |
+          echo "======================================="
+          echo "  월별 아카이브 결과"
+          echo "======================================="
+          echo "기준: ${{ steps.check.outputs.cutoff }} 이전 폴더"
+          echo "대상: ${{ steps.check.outputs.targets || '없음' }}"
+          if [ -d archive_tmp ]; then
+            echo "압축 파일:"
+            ls -lh archive_tmp/ 2>/dev/null || true
+          fi
+          echo "======================================="

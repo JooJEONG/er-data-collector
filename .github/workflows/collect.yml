@@ -3,7 +3,7 @@ name: 응급실 데이터 수집
 on:
   schedule:
     # 매 5분마다 실행 (UTC 기준, KST = UTC+9)
-    - cron: '*/5 * * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:  # 수동 실행도 가능
 
 permissions:

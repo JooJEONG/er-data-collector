@@ -1921,3 +1921,5 @@ timestamp,source,hospitals_collected,errors,duration_seconds,csv_path
 2026-05-22 11:11:44,mediboard,416,1,23.3,/home/runner/work/er-data-collector/er-data-collector/data/mediboard/2026-05/mediboard_2026-05-22.csv
 2026-05-22 15:39:11,data_go_kr,418,0,27.1,/home/runner/work/er-data-collector/er-data-collector/data/data_go_kr/2026-05/data_go_kr_2026-05-22.csv
 2026-05-22 15:39:11,mediboard,416,1,28.0,/home/runner/work/er-data-collector/er-data-collector/data/mediboard/2026-05/mediboard_2026-05-22.csv
+2026-05-22 19:15:57,data_go_kr,418,0,26.4,/home/runner/work/er-data-collector/er-data-collector/data/data_go_kr/2026-05/data_go_kr_2026-05-22.csv
+2026-05-22 19:15:57,mediboard,416,1,40.1,/home/runner/work/er-data-collector/er-data-collector/data/mediboard/2026-05/mediboard_2026-05-22.csv
